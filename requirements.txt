@@ -1,3 +1,4 @@
 requests>=2.31
 PyYAML>=6.0
 flask>=3.0
+gunicorn
