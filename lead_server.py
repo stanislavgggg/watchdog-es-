@@ -29,7 +29,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from flask import Flask, request, jsonify
@@ -186,54 +186,80 @@ def resolve_campaign_id() -> str:
                          want, c["id"], c.get("settings", {}).get("title")
                          or c.get("campaign_title", ""))
                 return c["id"]
-    log.error("welcome campaign web_id=%s not found in /campaigns nor /reports", want)
+    log.warning("welcome campaign web_id=%s not found — switching to member-activity mode", want)
     return ""
 
 
+def member_engagement(con, row) -> tuple:
+    """Открытия/клики контакта через member activity (без campaign id)."""
+    lst = mc_list_for(row["quiz"] if "quiz" in row.keys() else "laliga")
+    data = _mc_get(f"/lists/{lst}/members/{row['email_hash']}/activity", {"count": 50})
+    acts = {a.get("action") for a in data.get("activity", [])}
+    return (1 if "open" in acts else 0, 1 if "click" in acts else 0)
+
+
 def sync_engagement():
-    """Тянем open/click по welcome, матчим с лидами, шлём постбек за первое открытие."""
-    cid = resolve_campaign_id()
-    if not (cid and MC_KEY):
+    """Матчим open/click welcome с лидами и шлём постбек за первое открытие.
+    Приоритет: email-activity по кампании (если id зарезолвился), иначе —
+    опрос активности контактов (по одному запросу на неоткрывшего лида)."""
+    if not MC_KEY:
         return
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
-    offset, seen = 0, 0
-    while offset < 10000:
-        data = _mc_get(f"/reports/{cid}/email-activity",
-                       {"count": 1000, "offset": offset})
-        items = data.get("emails", [])
-        if not items:
-            break
-        for it in items:
-            email = (it.get("email_address") or "").lower()
-            acts = {a.get("action") for a in it.get("activity", [])}
-            if not email or not acts:
-                continue
-            opened = 1 if "open" in acts else 0
-            clicked = 1 if "click" in acts else 0
-            if not (opened or clicked):
-                continue
-            rows = con.execute(
-                "SELECT id,subid,opened,clicked,open_pb FROM leads "
-                "WHERE email=? AND event='lead' AND is_duplicate=0", (email,)).fetchall()
-            for row in rows:
-                con.execute("UPDATE leads SET opened=MAX(opened,?), clicked=MAX(clicked,?) "
-                            "WHERE id=?", (opened, clicked, row["id"]))
-                if opened and not row["open_pb"] and row["subid"]:
-                    try:
-                        url = KEITARO_PB_URL.format(subid=row["subid"], status=OPEN_STATUS)
-                        pr = requests.get(url, timeout=15)
-                        log.info("open postback %s -> %d", row["subid"], pr.status_code)
-                        con.execute("UPDATE leads SET open_pb=1 WHERE id=?", (row["id"],))
-                    except Exception as e:
-                        log.error("open postback failed %s: %s", row["subid"], e)
-            seen += 1
-        con.commit()
-        if len(items) < 1000:
-            break
-        offset += 1000
+    engagement: dict = {}
+
+    cid = resolve_campaign_id()
+    if cid:
+        offset = 0
+        while offset < 10000:
+            data = _mc_get(f"/reports/{cid}/email-activity",
+                           {"count": 1000, "offset": offset})
+            items = data.get("emails", [])
+            for it in items:
+                email = (it.get("email_address") or "").lower()
+                acts = {a.get("action") for a in it.get("activity", [])}
+                if email and acts:
+                    engagement[email] = ("open" in acts, "click" in acts)
+            if len(items) < 1000:
+                break
+            offset += 1000
+    else:
+        # fallback: активность по каждому свежему лиду без зафиксированного open
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat(
+            timespec="seconds")
+        rows = con.execute(
+            "SELECT * FROM leads WHERE event='lead' AND is_duplicate=0 "
+            "AND (opened=0 OR clicked=0) AND ts>=? LIMIT 400", (cutoff,)).fetchall()
+        for row in rows:
+            try:
+                o, c = member_engagement(con, row)
+                if o or c:
+                    engagement[row["email"]] = (bool(o), bool(c))
+            except Exception as e:
+                log.error("member activity failed %s: %s", row["email"], e)
+            time.sleep(0.12)  # бережём rate limit Mailchimp
+
+    fired = 0
+    for email, (opened, clicked) in engagement.items():
+        rows = con.execute(
+            "SELECT id,subid,open_pb FROM leads "
+            "WHERE email=? AND event='lead' AND is_duplicate=0", (email,)).fetchall()
+        for row in rows:
+            con.execute("UPDATE leads SET opened=MAX(opened,?), clicked=MAX(clicked,?) "
+                        "WHERE id=?", (int(opened), int(clicked), row["id"]))
+            if opened and not row["open_pb"] and row["subid"]:
+                try:
+                    url = KEITARO_PB_URL.format(subid=row["subid"], status=OPEN_STATUS)
+                    pr = requests.get(url, timeout=15)
+                    log.info("open postback %s -> %d", row["subid"], pr.status_code)
+                    con.execute("UPDATE leads SET open_pb=1 WHERE id=?", (row["id"],))
+                    fired += 1
+                except Exception as e:
+                    log.error("open postback failed %s: %s", row["subid"], e)
+    con.commit()
     con.close()
-    log.info("engagement sync done: %d engaged emails processed", seen)
+    log.info("engagement sync done: %d engaged, %d postbacks fired",
+             len(engagement), fired)
 
 
 def engagement_loop():
